@@ -1889,8 +1889,8 @@ template <class CHART> int CBuilderT <CHART> :: GetNamedNumber(const CBufferRefT
 // added (am) 2015-10-29
 template <class CHART> const CBufferRefT <CHART> & CBuilderT <CHART> :: GetNamedName(int nnumber) const
 {
-    static CHART* strEmpty = "";
-  
+	static const char *strEmpty = "";
+	
 	for(int i=0; i<m_namedlist.GetSize(); i++)
 	{
 		if( ((CBracketElx *)m_namedlist[i]->m_elxlist[0])->m_nnumber == nnumber )
