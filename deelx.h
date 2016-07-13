@@ -1779,7 +1779,7 @@ public:
 public:
 	ElxInterface * Build(const CBufferRefT <CHART> & pattern, int flags);
 	int GetNamedNumber(const CBufferRefT <CHART> & named) const;
-	const CBufferRefT <CHART> & GetNamedName(int nnumber) const;  // added (am) 2015-10-29
+	const CBufferRefT <CHART> GetNamedName(int nnumber) const;  // added (am) 2015-10-29
 	void Clear();
 
 public:
@@ -1887,17 +1887,17 @@ template <class CHART> int CBuilderT <CHART> :: GetNamedNumber(const CBufferRefT
 }
 
 // added (am) 2015-10-29
-template <class CHART> const CBufferRefT <CHART> & CBuilderT <CHART> :: GetNamedName(int nnumber) const
+template <class CHART> const CBufferRefT <CHART> CBuilderT <CHART> :: GetNamedName(int nnumber) const
 {
-	static const char *strEmpty = "";
-	
+	static const CHART _def[] = {0};
 	for(int i=0; i<m_namedlist.GetSize(); i++)
 	{
 		if( ((CBracketElx *)m_namedlist[i]->m_elxlist[0])->m_nnumber == nnumber )
 			return ((CBracketElx *)m_namedlist[i]->m_elxlist[0])->m_szNamed;
 	}
 
-	return strEmpty;
+	//return m_pattern.GetBuffer() + m_pattern.GetSize();
+	return _def;
 }
 
 template <class CHART> ElxInterface * CBuilderT <CHART> :: Build(const CBufferRefT <CHART> & pattern, int flags)
