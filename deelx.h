@@ -4485,12 +4485,29 @@ public:
 	int GetNamedGroupNumber(const CHART * group_name) const;
 	const CHART * GetNamedGroupName(int group_number) const;
 
-	// Limit the backtracking steps of one Match() or MatchExact() call (0: no
-	// limit, the default). Beyond it the call gives up: the result is "not
-	// matched" and MatchResult::IsStepLimitExceeded() is true. Replace()
-	// applies the limit to each search and stops replacing when one gives up.
+	// Limit the backtracking steps of one Match() or MatchExact() call. Beyond
+	// it the call gives up: the result is "not matched" and
+	// MatchResult::IsStepLimitExceeded() is true. Replace() applies the limit
+	// to each search and stops replacing when one gives up.
+	//   nLimit > 0 : at most nLimit steps
+	//   nLimit = 0 : no limit (STEP_LIMIT_NONE)
+	//   nLimit < 0 : automatic, the default (STEP_LIMIT_AUTO): the limit grows
+	//                with the length of the text, see GetEffectiveStepLimit()
 	void SetStepLimit(int nLimit);
-	int  GetStepLimit() const;
+	int  GetStepLimit() const;                         // 0, a positive value or STEP_LIMIT_AUTO
+	int  GetEffectiveStepLimit(int length) const;      // the limit for a text of this length, 0: none
+
+	enum
+	{
+		STEP_LIMIT_NONE = 0,
+		STEP_LIMIT_AUTO = -1,
+
+		// automatic limit = BASE + PER_CHAR * length. Ordinary patterns need
+		// about 1 to 5 steps per character, so only runaway backtracking
+		// (exponential, or quadratic on long texts) is stopped.
+		STEP_LIMIT_AUTO_BASE     = 1000000,
+		STEP_LIMIT_AUTO_PER_CHAR = 256
+	};
 
 public:
 	static void ReleaseString (CHART    * tstring );
@@ -4512,13 +4529,13 @@ protected:
 //
 template <class CHART> CRegexpT <CHART> :: CRegexpT(const CHART * pattern, int flags)
 {
-	m_nStepLimit = 0;
+	m_nStepLimit = STEP_LIMIT_AUTO;
 	Compile(pattern, CBufferRefT<CHART>(pattern).GetSize(), flags);
 }
 
 template <class CHART> CRegexpT <CHART> :: CRegexpT(const CHART * pattern, int length, int flags)
 {
-	m_nStepLimit = 0;
+	m_nStepLimit = STEP_LIMIT_AUTO;
 	Compile(pattern, length, flags);
 }
 
@@ -4544,12 +4561,24 @@ template <class CHART> void CRegexpT <CHART> :: Compile(const CHART * pattern, i
 
 template <class CHART> inline void CRegexpT <CHART> :: SetStepLimit(int nLimit)
 {
-	m_nStepLimit = nLimit > 0 ? nLimit : 0;
+	m_nStepLimit = nLimit > 0 ? nLimit : (nLimit == 0 ? (int)STEP_LIMIT_NONE : (int)STEP_LIMIT_AUTO);
 }
 
 template <class CHART> inline int CRegexpT <CHART> :: GetStepLimit() const
 {
 	return m_nStepLimit;
+}
+
+template <class CHART> int CRegexpT <CHART> :: GetEffectiveStepLimit(int length) const
+{
+	if(m_nStepLimit >= 0)
+		return m_nStepLimit;
+
+	if(length < 0) length = 0;
+	if(length > (INT_MAX - STEP_LIMIT_AUTO_BASE) / STEP_LIMIT_AUTO_PER_CHAR)
+		return INT_MAX;
+
+	return STEP_LIMIT_AUTO_BASE + STEP_LIMIT_AUTO_PER_CHAR * length;
 }
 
 //
@@ -4594,7 +4623,7 @@ template <class CHART> MatchResult CRegexpT <CHART> :: MatchExact(const CHART * 
 	pContext->m_pMatchString  = (void*)tstring;
 	pContext->m_pMatchStringLength = length;
 	pContext->m_nCursiveLimit = 100;
-	pContext->m_nStepLimit    = m_nStepLimit;
+	pContext->m_nStepLimit    = GetEffectiveStepLimit(length);
 	pContext->m_nSteps        = 0;
 
 	if(m_builder.m_nFlags & RIGHTTOLEFT)
@@ -4757,7 +4786,7 @@ template <class CHART> CContext * CRegexpT <CHART> :: PrepareMatch(const CHART *
 	pContext->m_pMatchString  = (void*)tstring;
 	pContext->m_pMatchStringLength = length;
 	pContext->m_nCursiveLimit = 100;
-	pContext->m_nStepLimit    = m_nStepLimit;
+	pContext->m_nStepLimit    = GetEffectiveStepLimit(length);
 
 	if(start < 0)
 	{

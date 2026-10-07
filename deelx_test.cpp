@@ -85,7 +85,9 @@
 //   * Recursion ((?R), (?1), ...) is limited to 100 levels per match path;
 //     deeper input simply does not match.
 //   * Plain backtracking: patterns like (.*a){12}c can take exponential time.
-//     Use CRegexpT::SetStepLimit() with untrusted patterns or input.
+//     A step limit that grows with the text length is on by default (see
+//     CRegexpT::SetStepLimit()); a call that exceeds it reports "not matched"
+//     with MatchResult::IsStepLimitExceeded() set.
 //   * Explicit group numbers are limited to DEELX_MAX_GROUP_NUMBER (65535,
 //     overridable); larger ones are treated as group names.
 // ===========================================================================
@@ -679,7 +681,7 @@ static void TestStepLimit()
 	text[31] = 0;
 
 	CRegexpA regexp("(.*a){12}c");
-	CHECK( regexp.GetStepLimit() == 0 );
+	CHECK( regexp.GetStepLimit() == CRegexpA::STEP_LIMIT_AUTO );
 	regexp.SetStepLimit(100000);
 	CHECK( regexp.GetStepLimit() == 100000 );
 
@@ -715,14 +717,77 @@ static void TestStepLimit()
 	CHECK( s != 0 && strcmp(s, "x x x") == 0 && !replaced.IsStepLimitExceeded() );
 	CRegexpA::ReleaseString(s);
 
-	// 0 or negative: no limit
+	// 0: no limit, negative: automatic
+	simple.SetStepLimit(0);
+	CHECK( simple.GetStepLimit() == CRegexpA::STEP_LIMIT_NONE );
+	CHECK( simple.GetEffectiveStepLimit(100) == 0 );
 	simple.SetStepLimit(-5);
-	CHECK( simple.GetStepLimit() == 0 );
+	CHECK( simple.GetStepLimit() == CRegexpA::STEP_LIMIT_AUTO );
 
 	// recursion counts too
 	CRegexpA recursive("^(a|(?R)a)*$");
 	recursive.SetStepLimit(1000);
 	CHECK( recursive.Match("aaaaaaaaaaaaaaaaaaaab").IsStepLimitExceeded() );
+}
+
+static void TestAutoStepLimit()
+{
+	// on by default, and it grows with the text length
+	CRegexpA regexp("(.*a){12}c");
+	int small = regexp.GetEffectiveStepLimit(10);
+	int large = regexp.GetEffectiveStepLimit(1000000);
+	CHECK( small >= CRegexpA::STEP_LIMIT_AUTO_BASE && large > small );
+	CHECK( regexp.GetEffectiveStepLimit(INT_MAX) == INT_MAX );
+	CHECK( regexp.GetEffectiveStepLimit(-1) == small - 10 * CRegexpA::STEP_LIMIT_AUTO_PER_CHAR );
+
+	// runaway backtracking is stopped without any setting
+	char text[64];
+	memset(text, 'a', 40);
+	text[40] = 'b';
+	text[41] = 0;
+	CHECK( regexp.Match(text).IsStepLimitExceeded() );
+	CHECK( regexp.MatchExact(text).IsStepLimitExceeded() );
+
+	// an explicit limit and "no limit" win over the automatic one
+	regexp.SetStepLimit(500);
+	CHECK( regexp.GetEffectiveStepLimit(1000000) == 500 );
+	regexp.SetStepLimit(0);
+	CHECK( regexp.GetEffectiveStepLimit(1000000) == 0 );
+
+	// scanning a long text for something that is not there is not a runaway
+	// (short words: one long run of word characters would make \w+@ quadratic)
+	const char unit[] = "the quick brown fox jumps over the lazy dog\n";
+	int n = 4000000;
+	char * big = (char *)malloc(n + 1);
+	CHECK( big != 0 );
+	if(big)
+	{
+		for(int i = 0; i < n; i ++) big[i] = unit[i % (sizeof(unit) - 1)];
+		big[n] = 0;
+		CRegexpA alt("(foo|bar)baz");
+		MatchResult result = alt.Match(big);
+		CHECK( !result.IsMatched() && !result.IsStepLimitExceeded() );
+		CRegexpA word("\\w+@\\w+\\.com");
+		result = word.Match(big);
+		CHECK( !result.IsMatched() && !result.IsStepLimitExceeded() );
+		CRegexpA lines("^.*zzz$", MULTILINE);
+		result = lines.Match(big);
+		CHECK( !result.IsMatched() && !result.IsStepLimitExceeded() );
+		free(big);
+	}
+
+	// quadratic on one long run: \w+@ retries from every character of it
+	n = 200000;
+	big = (char *)malloc(n + 1);
+	CHECK( big != 0 );
+	if(big)
+	{
+		memset(big, 'x', n);
+		big[n] = 0;
+		CRegexpA email("\\w+@");
+		CHECK( email.Match(big).IsStepLimitExceeded() );
+		free(big);
+	}
 }
 
 static void TestInlineExtended()
@@ -1007,6 +1072,7 @@ int main()
 	TestSortedBufferFind();
 	TestReplaceSegmentLengths();
 	TestStepLimit();
+	TestAutoStepLimit();
 	TestInlineExtended();
 	TestHorizontalSpace();
 	TestLineBreak();
