@@ -131,6 +131,7 @@ static void TestBasic()
 		int ntail = regexp.GetNamedGroupNumber("tail");
 		CHECK( ntail == 2 );
 		CHECK( result.GetGroupStart(ntail) == 7 );
+		CHECK( strcmp(regexp.GetNamedGroupName(ntail), "tail") == 0 );
 	}
 
 	CHECK( ReplaceEquals("a", "banana", "o", "bonono") );
@@ -503,6 +504,45 @@ static void TestMinMaxNotMacros()
 	CHECK( !regexp.Match(Wide("DeFl", t)).IsMatched() );
 }
 
+static void TestNamedGroupName()
+{
+	{
+		CRegexpA regexp("(\\d+)-(?<tail>\\d+)");
+		CHECK( strcmp(regexp.GetNamedGroupName(2), "tail") == 0 );
+		CHECK( strcmp(regexp.GetNamedGroupName(1), "") == 0 ); // unnamed
+		CHECK( strcmp(regexp.GetNamedGroupName(0), "") == 0 );
+		CHECK( strcmp(regexp.GetNamedGroupName(9), "") == 0 ); // no such group
+		CHECK( strcmp(regexp.GetNamedGroupName(-1), "") == 0 );
+	}
+	{
+		// named groups are numbered after the unnamed ones, ignoring explicit
+		// numbers, so "n" gets 1 too. (?<1>...) and (?<2>...) are kept in the
+		// same list without a name and must not hide "n".
+		CRegexpA regexp("(?<2>a)(?<1>b)(?<n>c)");
+		CHECK( regexp.GetNamedGroupNumber("n") == 1 );
+		CHECK( strcmp(regexp.GetNamedGroupName(1), "n") == 0 );
+		CHECK( strcmp(regexp.GetNamedGroupName(2), "") == 0 );
+	}
+	{
+		CRegexpA regexp("(?'q'a)(?P<p>b)(?<q>c)"); // all name syntaxes, a repeated name
+		CHECK( strcmp(regexp.GetNamedGroupName(1), "q") == 0 );
+		CHECK( strcmp(regexp.GetNamedGroupName(2), "p") == 0 );
+	}
+	{
+		CRegexpA regexp("(?<old>a)");
+		regexp.Compile("(?<new>a)");
+		CHECK( strcmp(regexp.GetNamedGroupName(1), "new") == 0 );
+		regexp.Compile(0);
+		CHECK( strcmp(regexp.GetNamedGroupName(1), "") == 0 );
+	}
+	{
+		unsigned short p[64];
+		CRegexpW regexp(Wide("(?<wide>a)", p));
+		CHECK( WideEquals(regexp.GetNamedGroupName(1), "wide") );
+		CHECK( WideEquals(regexp.GetNamedGroupName(2), "") );
+	}
+}
+
 static void TestSortedBufferFind()
 {
 	CSortedBufferT <int> sorted;
@@ -571,6 +611,7 @@ int main()
 	TestExtendedCharset();
 	TestContextInitialized();
 	TestMinMaxNotMacros();
+	TestNamedGroupName();
 	TestSortedBufferFind();
 	TestReplaceSegmentLengths();
 

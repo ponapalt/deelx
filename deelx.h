@@ -1870,6 +1870,7 @@ public:
 public:
 	ElxInterface * Build(const CBufferRefT <CHART> & pattern, int flags);
 	int GetNamedNumber(const CBufferRefT <CHART> & named) const;
+	const CHART * GetNamedName(int nnumber) const;
 	void Clear();
 
 public:
@@ -2002,6 +2003,26 @@ template <class CHART> int CBuilderT <CHART> :: GetNamedNumber(const CBufferRefT
 	}
 
 	return -3;
+}
+
+//
+// Name of group nnumber as a NUL-terminated string, or "" if it has none.
+// The string is owned by the builder and valid until the next Build/Clear.
+//
+template <class CHART> const CHART * CBuilderT <CHART> :: GetNamedName(int nnumber) const
+{
+	static const CHART _def[] = {0};
+
+	for(int i=0; i<m_namedlist.GetSize(); i++)
+	{
+		const CBracketElx * pleft = (const CBracketElx *)m_namedlist[i]->m_elxlist[0];
+
+		// (?<2>...) is kept in m_namedlist too, but has no name
+		if( pleft->m_nnumber == nnumber && pleft->m_szNamed.GetSize() > 0 )
+			return pleft->m_szNamed.GetBuffer();
+	}
+
+	return _def;
 }
 
 template <class CHART> ElxInterface * CBuilderT <CHART> :: Build(const CBufferRefT <CHART> & pattern, int flags)
@@ -3763,6 +3784,7 @@ public:
 	CHART * Replace(const CHART * tstring, const CHART * replaceto, int start = -1, int ntimes = -1, MatchResult * result = 0, CContext * pContext = 0) const;
 	CHART * Replace(const CHART * tstring, int string_length, const CHART * replaceto, int to_length, int & result_length, int start = -1, int ntimes = -1, MatchResult * result = 0, CContext * pContext = 0) const;
 	int GetNamedGroupNumber(const CHART * group_name) const;
+	const CHART * GetNamedGroupName(int group_number) const;
 
 public:
 	static void ReleaseString (CHART    * tstring );
@@ -3994,6 +4016,11 @@ template <class CHART> CContext * CRegexpT <CHART> :: PrepareMatch(const CHART *
 template <class CHART> inline int CRegexpT <CHART> :: GetNamedGroupNumber(const CHART * group_name) const
 {
 	return m_builder.GetNamedNumber(group_name);
+}
+
+template <class CHART> inline const CHART * CRegexpT <CHART> :: GetNamedGroupName(int group_number) const
+{
+	return m_builder.GetNamedName(group_number);
 }
 
 template <class CHART> CHART * CRegexpT <CHART> :: Replace(const CHART * tstring, const CHART * replaceto, int start, int ntimes, MatchResult * result, CContext * pContext) const
