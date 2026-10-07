@@ -17,10 +17,14 @@
 //     compilers (g++, clang, recent MSVC). Therefore in deelx.h:
 //       - no C++11 or later (no auto, nullptr, override, range-for, etc.)
 //       - no STL containers/strings, no RTTI; only C headers plus <new>
-//       - the only exception thrown is std::bad_alloc, and only through
+//       - the only exception leaving deelx.h is std::bad_alloc, and only from
 //         deelx_realloc() / deelx_check_new() (VC6's new returns 0 instead
 //         of throwing). Keep objects consistent when an allocation throws:
-//         update pointers/capacities only after the allocation succeeded
+//         update pointers/capacities only after the allocation succeeded.
+//         deelx_step_limit_exceeded is thrown by CContext::Step() and always
+//         caught in CRegexpT::Match()/MatchExact()
+//       - this file and deelx.h stay ASCII (VC6 and code pages); write
+//         non-ASCII test text as UTF-8 \x escapes and convert with U16()
 //       - no member templates or partial specialization tricks VC6 can't parse
 //       - VC6 leaks for-loop variables into the enclosing scope: do not
 //         declare the same loop variable twice in one scope
@@ -37,6 +41,17 @@
 //     need NOT be NUL-terminated; never read past the given length.
 //   * Keep public API and the global names (CRegexpA, MatchResult, flags such
 //     as IGNORECASE) source compatible; downstream projects include deelx.h.
+//     Without UNICODE_MODE, existing patterns must behave as before (\w, \d,
+//     \s, \b and IGNORECASE stay ASCII). Do not name anything UNICODE: it is
+//     a Windows macro.
+//   * The backtracking protocol: Match() pushes its state on m_stack only
+//     when it succeeds; MatchNext() pops it, and pushes again only when it
+//     succeeds. An element whose char length varies (UNICODE_MODE surrogate
+//     pairs) pushes the length. Elements that loop or backtrack call
+//     pContext->Step() so the step limit can stop them.
+//   * The Unicode tables at the end of deelx.h are generated from the UCD
+//     (UnicodeData.txt, CaseFolding.txt). Regenerate them rather than edit
+//     them by hand, and check every code point against the UCD afterwards.
 //
 // Style
 //   Tabs for indentation, braces on their own line, Hungarian-ish names as in
@@ -53,14 +68,24 @@
 //   check fails. Add a regression test here for every bug fixed in deelx.h.
 //
 // Known limitations (not bugs to "fix" casually)
-//   * Not MBCS aware: Shift_JIS trail bytes may match ASCII in some cases.
-//   * \w, \b, \d and case folding are ASCII only, also for CRegexpW.
+//   * CRegexpA is not MBCS aware: Shift_JIS trail bytes may match ASCII, and
+//     '.' etc. match single bytes. UNICODE_MODE has no effect on it.
+//   * \w, \b, \d, \s and case folding are ASCII only unless UNICODE_MODE
+//     (or (?u)) is given. With it, case-insensitive literals and
+//     backreferences are compared per UTF-16 code unit, so chars above
+//     U+FFFF (e.g. Deseret) are not case folded there; classes do fold them.
+//   * Simple case folding only: "ss" does not match U+00DF.
+//   * \p{...} supports general categories and Any, Assigned, ASCII, L&/LC,
+//     White_Space/Space, Word, Xan, Xsp, Xps, Xwd; no scripts or blocks.
+//     Unknown names match nothing (\P{...}: any char).
+//   * \v is the vertical tab char (as before), not the vertical space class.
+//   * \K inside lookaround is not supported.
 //   * Invalid patterns are never reported: they compile to something (e.g.
 //     "a**" takes the second '*' literally, an unknown backreference fails).
 //   * Recursion ((?R), (?1), ...) is limited to 100 levels per match path;
 //     deeper input simply does not match.
-//   * Plain backtracking without step limit: patterns like (a*)*b can take
-//     exponential time. Do not run untrusted patterns on untrusted input.
+//   * Plain backtracking: patterns like (.*a){12}c can take exponential time.
+//     Use CRegexpT::SetStepLimit() with untrusted patterns or input.
 //   * Explicit group numbers are limited to DEELX_MAX_GROUP_NUMBER (65535,
 //     overridable); larger ones are treated as group names.
 // ===========================================================================
@@ -583,6 +608,373 @@ static void TestReplaceSegmentLengths()
 	CRegexpW::ReleaseString(ws);
 }
 
+//
+// UTF-8 (written with \x escapes, so this file stays ASCII) to UTF-16
+//
+static const unsigned short * U16(const char * s, unsigned short * buf)
+{
+	const unsigned char * p = (const unsigned char *)s;
+	int n = 0;
+
+	while(*p != 0 && n < 60)
+	{
+		unsigned int cp;
+
+		if     (p[0] < 0x80) { cp = p[0]; p += 1; }
+		else if(p[0] < 0xE0) { cp = ((p[0] & 0x1F) <<  6) |  (p[1] & 0x3F); p += 2; }
+		else if(p[0] < 0xF0) { cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) <<  6) |  (p[2] & 0x3F); p += 3; }
+		else                 { cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F); p += 4; }
+
+		if(cp >= 0x10000)
+		{
+			buf[n++] = (unsigned short)(0xD800 + ((cp - 0x10000) >> 10));
+			buf[n++] = (unsigned short)(0xDC00 + ((cp - 0x10000) & 0x3FF));
+		}
+		else
+			buf[n++] = (unsigned short)cp;
+	}
+
+	buf[n] = 0;
+	return buf;
+}
+
+// pattern is ASCII (use \u{...}), text is UTF-8
+static MatchResult MatchW(const char * pattern, const char * text, int flags = 0)
+{
+	unsigned short p[64], t[64];
+	CRegexpW regexp(Wide(pattern, p), flags);
+	return regexp.Match(U16(text, t));
+}
+
+static int MatchSpanW(const char * pattern, const char * text, int flags, int start, int end)
+{
+	MatchResult result = MatchW(pattern, text, flags);
+	return result.IsMatched() && result.GetStart() == start && result.GetEnd() == end;
+}
+
+// some chars as UTF-8
+#define E_ACUTE   "\xc3\xa9"         // U+00E9
+#define E_ACUTE_U "\xc3\x89"         // U+00C9
+#define HIRA_A    "\xe3\x81\x82"     // U+3042
+#define FW_ONE    "\xef\xbc\x91"     // U+FF11 fullwidth digit one
+#define IDEO_SP   "\xe3\x80\x80"     // U+3000 ideographic space
+#define CYR_DE    "\xd0\xb4"         // U+0434
+#define CYR_DE_U  "\xd0\x94"         // U+0414
+#define SIGMA     "\xcf\x83"         // U+03C3
+#define SIGMA_F   "\xcf\x82"         // U+03C2 final sigma
+#define SIGMA_U   "\xce\xa3"         // U+03A3
+#define KELVIN    "\xe2\x84\xaa"     // U+212A, folds to 'k'
+#define ARABIC_3  "\xd9\xa3"         // U+0663 Arabic-Indic digit three
+#define LINE_SEP  "\xe2\x80\xa8"     // U+2028
+#define UNASSIGN  "\xcd\xb8"         // U+0378, unassigned
+#define GRIN      "\xf0\x9f\x98\x80" // U+1F600, a surrogate pair in UTF-16
+#define GRIN2     "\xf0\x9f\x98\x81" // U+1F601
+
+static void TestStepLimit()
+{
+	// (.*a){12}c takes exponential time on "aaa...ab"
+	char text[64];
+	memset(text, 'a', 30);
+	text[30] = 'b';
+	text[31] = 0;
+
+	CRegexpA regexp("(.*a){12}c");
+	CHECK( regexp.GetStepLimit() == 0 );
+	regexp.SetStepLimit(100000);
+	CHECK( regexp.GetStepLimit() == 100000 );
+
+	MatchResult result = regexp.Match(text);
+	CHECK( !result.IsMatched() && result.IsStepLimitExceeded() );
+
+	result = regexp.MatchExact(text);
+	CHECK( !result.IsMatched() && result.IsStepLimitExceeded() );
+
+	// a copy keeps the flag
+	MatchResult copy = result;
+	CHECK( copy.IsStepLimitExceeded() );
+
+	// the context is spent: matching with it again finds nothing
+	CContext * pContext = regexp.PrepareMatch(text);
+	CHECK( regexp.Match(pContext).IsStepLimitExceeded() );
+	result = regexp.Match(pContext);
+	CHECK( !result.IsMatched() && !result.IsStepLimitExceeded() );
+	CRegexpA::ReleaseContext(pContext);
+
+	// Replace gives up too and returns the text unchanged
+	MatchResult replaced;
+	char * s = regexp.Replace(text, "x", -1, -1, &replaced);
+	CHECK( s != 0 && strcmp(s, text) == 0 && replaced.IsStepLimitExceeded() );
+	CRegexpA::ReleaseString(s);
+
+	// cheap matches are not affected, and the counter starts again per Match
+	CRegexpA simple("(a|b)+c");
+	simple.SetStepLimit(1000);
+	CHECK( simple.Match("ababc").IsMatched() );
+	CHECK( !simple.Match("ababc").IsStepLimitExceeded() );
+	s = simple.Replace("abc abc abc", "x", -1, -1, &replaced);
+	CHECK( s != 0 && strcmp(s, "x x x") == 0 && !replaced.IsStepLimitExceeded() );
+	CRegexpA::ReleaseString(s);
+
+	// 0 or negative: no limit
+	simple.SetStepLimit(-5);
+	CHECK( simple.GetStepLimit() == 0 );
+
+	// recursion counts too
+	CRegexpA recursive("^(a|(?R)a)*$");
+	recursive.SetStepLimit(1000);
+	CHECK( recursive.Match("aaaaaaaaaaaaaaaaaaaab").IsStepLimitExceeded() );
+}
+
+static void TestInlineExtended()
+{
+	CHECK(  MatchA("^(?x) a b c $", "abc") );
+	CHECK( !MatchA("^(?x) a b c $", "a b c") );
+	CHECK(  MatchA("^(?x)a # comment\n b$", "ab") );
+	CHECK(  MatchA("^(?x)a +$", "aaa") );                 // white space before a quantifier
+	CHECK(  MatchA("^a(?x: b c )d$", "abcd") );
+	CHECK(  MatchA("^(?x: b ) c$", "b c") );              // ends with the group
+	CHECK( !MatchA("^(?x: b ) c$", "bc") );
+	CHECK(  MatchA("^(a(?x) b) c$", "ab c") );            // (?x) ends with its group
+	CHECK( !MatchA("^(a(?x) b) c$", "abc") );
+	CHECK(  MatchA("^a(?-x) b$", "a b", EXTENDED) );
+	CHECK(  MatchA("^(?x)[ ]a$", " a") );                 // literal in [...]
+	CHECK(  MatchA("^(?x)a(?-x) b$", "a b") );
+	CHECK(  MatchA("^(?x)a{2} b$", "aab") );
+	CHECK(  MatchA("^(?x: a | b )$", "b") );
+	CHECK(  MatchA("^(?(?=a)(?x) a b| c d)$", "ab") );    // yes branch only
+	CHECK(  MatchA("^(?(?=a)(?x) a b| c d)$", " c d") );
+}
+
+static void TestHorizontalSpace()
+{
+	CHECK(  MatchA("^\\h+$", " \t") );
+	CHECK( !MatchA("\\h", "\n\r\v\f") );
+	CHECK(  MatchA("^\\H+$", "ab\n") );
+	CHECK(  MatchA("^[\\hx]+$", " x\t") );
+	CHECK( !MatchA("\\h", "\xa0") );                     // CRegexpA: 0xA0 is a byte of a multibyte char
+	CHECK(  MatchW("^\\h$", IDEO_SP).IsMatched() );
+	CHECK(  MatchW("^\\h$", "\xc2\xa0").IsMatched() );
+	CHECK( !MatchW("\\H", IDEO_SP).IsMatched() );
+	CHECK(  MatchA("^h\\h$", "h ", RIGHTTOLEFT) );
+}
+
+static void TestLineBreak()
+{
+	CHECK(  MatchA("^a\\Rb$", "a\r\nb") );
+	CHECK(  MatchA("^a\\Rb$", "a\nb") );
+	CHECK(  MatchA("^a\\Rb$", "a\rb") );
+	CHECK(  MatchA("^a\\Rb$", "a\fb") );
+	CHECK( !MatchA("^a\\R\\nb$", "a\r\nb") );           // atomic, as in Perl
+	CHECK(  MatchA("^a\\R{2}b$", "a\n\r\nb") );
+	CHECK(  MatchA("^a\\Rb$", "a\r\nb", RIGHTTOLEFT) );
+	CHECK(  MatchA("^[\\R]$", "R") );                    // literal in [...]
+	CHECK(  MatchW("^a\\Rb$", "a" LINE_SEP "b").IsMatched() );
+}
+
+static void TestKeep()
+{
+	CRegexpA regexp("foo=\\Kbar");
+	MatchResult result = regexp.Match("x foo=bar");
+	CHECK( result.IsMatched() && result.GetStart() == 6 && result.GetEnd() == 9 );
+
+	CHECK( ReplaceEquals("foo=\\Kbar", "foo=bar", "X", "foo=X") );
+	CHECK( ReplaceEquals("a\\K", "aaa", "-", "a-a-a-") );
+	CHECK( ReplaceEquals("\\d+\\K(?=px)", "10px 2px", "!", "10!px 2!px") );
+
+	// undone by backtracking
+	CRegexpA back("a\\Kb|ac");
+	result = back.Match("ac");
+	CHECK( result.IsMatched() && result.GetStart() == 0 && result.GetEnd() == 2 );
+
+	CHECK(  MatchA("^[\\K]$", "K") );                    // literal in [...]
+
+	CRegexpA exact("a\\Kb");
+	result = exact.MatchExact("ab");
+	CHECK( result.IsMatched() && result.GetStart() == 1 && result.GetEnd() == 2 );
+}
+
+static void TestBranchReset()
+{
+	CHECK(  MatchA("^(?|(a)|(b))\\1$", "aa") );
+	CHECK(  MatchA("^(?|(a)|(b))\\1$", "bb") );
+	CHECK( !MatchA("^(?|(a)|(b))\\1$", "ab") );
+
+	// the group after continues from the largest number
+	CRegexpA regexp("(?|(a)|(b)(c))(d)");
+	MatchResult result = regexp.Match("bcd");
+	CHECK( result.IsMatched() && result.MaxGroupNumber() == 3 );
+	CHECK( result.GetGroupStart(1) == 0 && result.GetGroupStart(2) == 1 && result.GetGroupStart(3) == 2 );
+
+	result = regexp.Match("ad");
+	CHECK( result.IsMatched() && result.GetGroupStart(1) == 0 && result.GetGroupStart(2) == -1 && result.GetGroupStart(3) == 1 );
+
+	// a subroutine call goes to the first group with the number
+	CHECK(  MatchA("^(?|(a)|(b))(?1)$", "ba") );
+	CHECK( !MatchA("^(?|(a)|(b))(?1)$", "bb") );
+
+	CHECK(  MatchA("^(?|)x$", "x") );
+	CHECK(  ReplaceEquals("(?|(\\d+)|([a-z]+))", "12 ab", "<$1>", "<12> <ab>") );
+}
+
+static void TestUnicodeProperty()
+{
+	// \p{...} works without UNICODE_MODE too
+	CHECK(  MatchW("^\\p{L}$", "a").IsMatched() );
+	CHECK(  MatchW("^\\pL$", HIRA_A).IsMatched() );
+	CHECK( !MatchW("\\p{L}", "1").IsMatched() );
+	CHECK(  MatchW("^\\P{L}$", "1").IsMatched() );
+	CHECK(  MatchW("^\\p{^L}$", "1").IsMatched() );
+	CHECK( !MatchW("\\P{^L}", "1").IsMatched() );
+	CHECK(  MatchW("^\\p{Lu}$", "A").IsMatched() );
+	CHECK( !MatchW("\\p{Lu}", "a").IsMatched() );
+	CHECK(  MatchW("^\\p{Lu}$", E_ACUTE_U).IsMatched() );
+	CHECK(  MatchW("^\\p{Nd}$", ARABIC_3).IsMatched() );
+	CHECK(  MatchW("^\\p{N}$", FW_ONE).IsMatched() );
+	CHECK(  MatchW("^\\p{Zs}$", IDEO_SP).IsMatched() );
+	CHECK(  MatchW("^\\p{L&}+$", "aB").IsMatched() );
+	CHECK( !MatchW("\\p{LC}", HIRA_A).IsMatched() );
+	CHECK(  MatchW("^\\p{Any}$", HIRA_A).IsMatched() );
+	CHECK(  MatchW("^\\p{Assigned}$", HIRA_A).IsMatched() );
+	CHECK( !MatchW("\\p{Assigned}", UNASSIGN).IsMatched() );
+	CHECK(  MatchW("^\\p{Cn}$", UNASSIGN).IsMatched() );
+	CHECK(  MatchW("^\\p{ASCII}+$", "a~").IsMatched() );
+	CHECK( !MatchW("\\p{ASCII}", E_ACUTE).IsMatched() );
+	CHECK(  MatchW("^\\p{White_Space}+$", " \t" IDEO_SP).IsMatched() );
+	CHECK(  MatchW("^\\p{Space}$", LINE_SEP).IsMatched() );
+	CHECK(  MatchW("^\\p{Word}+$", "a_1" HIRA_A).IsMatched() );
+	CHECK(  MatchW("^\\p{Xan}+$", "a1" FW_ONE).IsMatched() );
+	CHECK( !MatchW("\\p{Xan}", "_").IsMatched() );
+	CHECK(  MatchW("^\\p{Xwd}$", "_").IsMatched() );
+
+	// in [...], negated, with other members
+	CHECK(  MatchW("^[\\p{Lu}\\d]+$", "A1" E_ACUTE_U).IsMatched() );
+	CHECK( !MatchW("^[\\p{Lu}\\d]+$", "Aa").IsMatched() );
+	CHECK(  MatchW("^[^\\p{L}]+$", "12 ").IsMatched() );
+	CHECK(  MatchW("^[\\P{L}a]+$", "1a").IsMatched() );
+
+	// properties ignore IGNORECASE, as in PCRE
+	CHECK( !MatchW("\\p{Lu}", "a", IGNORECASE).IsMatched() );
+
+	// unknown names match nothing, \P of them anything
+	CHECK( !MatchW("\\p{Hiragana}", HIRA_A).IsMatched() );
+	CHECK(  MatchW("^\\P{Hiragana}$", HIRA_A).IsMatched() );
+	CHECK( !MatchW("\\p{}", "a").IsMatched() );
+
+	// not a property: literal
+	CHECK(  MatchW("^\\p{L$", "p{L").IsMatched() );
+	CHECK(  MatchA("^\\p$", "p") );
+
+	// CRegexpA: bytes as U+0000..U+00FF
+	CHECK(  MatchA("^\\p{Lu}+$", "AB") );
+	CHECK( !MatchA("\\p{Lu}", "ab") );
+
+	// right to left
+	CHECK(  MatchW("^\\p{L}\\p{N}$", "a1", RIGHTTOLEFT).IsMatched() );
+
+	// without UNICODE_MODE the halves of a surrogate pair are separate chars
+	CHECK(  MatchW("^\\p{Cs}\\p{Cs}$", GRIN).IsMatched() );
+	CHECK(  MatchW("^\\p{So}$", GRIN, UNICODE_MODE).IsMatched() );
+}
+
+static void TestUnicodeMode()
+{
+	// \w \d \s \b
+	CHECK(  MatchW("^\\w$", E_ACUTE, UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("\\w", E_ACUTE).IsMatched() );          // ASCII only without the flag
+	CHECK(  MatchW("^\\w+$", HIRA_A "x" FW_ONE, UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("\\W", HIRA_A, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^\\d$", FW_ONE, UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("\\d", FW_ONE).IsMatched() );
+	CHECK(  MatchW("^\\D$", HIRA_A, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^\\s$", IDEO_SP, UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("\\S", IDEO_SP, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchSpanW("\\b\\w+\\b", " " HIRA_A HIRA_A " ", UNICODE_MODE, 1, 3) );
+	CHECK( !MatchW("\\b", HIRA_A).IsMatched() );          // no word chars without the flag
+	CHECK(  MatchW("^[\\w]$", E_ACUTE, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("(?u)^\\w$", E_ACUTE).IsMatched() );
+	CHECK( !MatchW("(?-u)\\w", E_ACUTE, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^(?u:\\w)\\w$", E_ACUTE "a").IsMatched() );
+	CHECK( !MatchW("^(?u:\\w)\\w$", "a" E_ACUTE).IsMatched() );
+
+	// case folding
+	CHECK(  MatchW("^\\u0434$", CYR_DE_U, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("^\\u0434$", CYR_DE_U, IGNORECASE).IsMatched() ); // ASCII only without the flag
+	CHECK(  MatchW("^\\u00e9$", E_ACUTE_U, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^\\u03c2$", SIGMA_U, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^\\u03a3$", SIGMA_F, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^k$", KELVIN, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[\\u0430-\\u044f]+$", CYR_DE_U CYR_DE, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("[\\u0430-\\u044f]", CYR_DE_U, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[\\u03c2]$", SIGMA, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[\\u03a3]$", SIGMA_F, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[a-z]$", KELVIN, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[^\\u03c3]$", "x", IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("^[^\\u03c3]$", SIGMA_U, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^(\\u0434)\\1$", CYR_DE CYR_DE_U, IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^ABC$", "abc", IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^\\u0434$", CYR_DE_U, IGNORECASE | UNICODE_MODE | RIGHTTOLEFT).IsMatched() );
+
+	// surrogate pairs are one char
+	CHECK(  MatchW("^.$", GRIN, UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("^.$", GRIN).IsMatched() );
+	CHECK( !MatchW("^..$", GRIN, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^.{2}$", GRIN GRIN2, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^.*b$", GRIN GRIN "b", UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^(.)+?b$", GRIN GRIN "b", UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[^a]$", GRIN, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^\\W$", GRIN, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[[:^alpha:]]$", GRIN, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[\\u{1F600}-\\u{1F64F}]+$", GRIN GRIN2, UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("^[\\u{1F600}-\\u{1F64F}]+$", "a", UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^\\u{1F600}+$", GRIN GRIN, UNICODE_MODE).IsMatched() );
+	CHECK( !MatchW("^\\u{1F600}+$", GRIN GRIN).IsMatched() ); // + applies to the low half only
+	CHECK(  MatchW("^\\u{1F600}$", GRIN).IsMatched() );       // \u{...} above U+FFFF is a pair
+	CHECK(  MatchW("^x\\u{1F600}{2}y$", "x" GRIN GRIN "y", UNICODE_MODE).IsMatched() );
+	CHECK(  MatchSpanW("(?<=.)x", GRIN "x", UNICODE_MODE, 2, 3) );
+	CHECK(  MatchSpanW(".", "a" GRIN, UNICODE_MODE | RIGHTTOLEFT, 1, 3) );
+	CHECK( !MatchW("\\b", GRIN, UNICODE_MODE).IsMatched() ); // not a word char
+
+	// no match starts between the halves of a pair
+	CHECK( !MatchW("\\p{Cs}", GRIN, UNICODE_MODE).IsMatched() );
+	CHECK(  MatchSpanW("", GRIN, UNICODE_MODE, 0, 0) );
+
+	{
+		unsigned short p[64], t[64], to[64];
+		CRegexpW regexp(Wide("", p), UNICODE_MODE);
+		unsigned short * s = regexp.Replace(U16(GRIN "a", t), Wide("-", to));
+		unsigned short expected[64];
+		U16("-" GRIN "-a-", expected);
+		int ok = s != 0;
+		for(int i=0; ok && (s[i] != 0 || expected[i] != 0); i++) ok = s[i] == expected[i];
+		CHECK( ok );
+		CRegexpW::ReleaseString(s);
+	}
+
+	// classes fold chars above U+FFFF too (Deseret U+10400 / U+10428)
+	CHECK(  MatchW("^[\\u{10400}]$", "\xf0\x90\x90\xa8", IGNORECASE | UNICODE_MODE).IsMatched() );
+	CHECK(  MatchW("^[\\u{10428}]$", "\xf0\x90\x90\x80", IGNORECASE | UNICODE_MODE).IsMatched() );
+
+	// the tables (checked against the whole UCD when generated)
+	CHECK( deelx_unicode_category(0x41)    == DEELX_UC_Lu );
+	CHECK( deelx_unicode_category(0x3042)  == DEELX_UC_Lo );
+	CHECK( deelx_unicode_category(0x0378)  == DEELX_UC_Cn );
+	CHECK( deelx_unicode_category(0x1F600) == DEELX_UC_So );
+	CHECK( deelx_unicode_category(0x10FFFF) == DEELX_UC_Cn );
+	CHECK( deelx_unicode_category(0x110000) == DEELX_UC_Cn );
+	CHECK( deelx_unicode_fold(0x41)   == 0x61 );
+	CHECK( deelx_unicode_fold(0x61)   == 0x61 );
+	CHECK( deelx_unicode_fold(0x3A3)  == 0x3C3 );
+	CHECK( deelx_unicode_fold(0x3C2)  == 0x3C3 );
+	CHECK( deelx_unicode_fold(0x212A) == 0x6B );
+	CHECK( deelx_unicode_fold(0x10400) == 0x10428 );
+	CHECK( deelx_unicode_fold(0x101)  == 0x101 );  // between the chars of a step-2 range
+	CHECK( deelx_unicode_fold(0x100)  == 0x101 );
+
+	// CRegexpA ignores the flag
+	CHECK( !MatchA("^\\w$", "\xe9", UNICODE_MODE) );
+	CHECK( !MatchA("^\\xe9$", "\xc9", IGNORECASE | UNICODE_MODE) );
+}
+
 int main()
 {
 	setvbuf(stdout, 0, _IONBF, 0); // keep output even if a test crashes
@@ -614,6 +1006,14 @@ int main()
 	TestNamedGroupName();
 	TestSortedBufferFind();
 	TestReplaceSegmentLengths();
+	TestStepLimit();
+	TestInlineExtended();
+	TestHorizontalSpace();
+	TestLineBreak();
+	TestKeep();
+	TestBranchReset();
+	TestUnicodeProperty();
+	TestUnicodeMode();
 
 	printf("%d checks, %d failures\n", g_nChecks, g_nFailures);
 	return g_nFailures == 0 ? 0 : 1;
